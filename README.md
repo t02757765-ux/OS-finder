@@ -1,2 +1,2 @@
 # OS-finder
-finder Operation systems 
+find Operation systems 
