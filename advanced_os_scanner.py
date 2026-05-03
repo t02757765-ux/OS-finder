@@ -83,17 +83,74 @@ class AdvancedScanner:
 
     def parse_nmap_output(self, output):
         """Nmap çıktısını parse ederek yapılandırılmış veri elde etme"""
-        data = {"raw": output, "os": [], "ports": []}
+        data = {"raw": output, "os": [], "ports": [], "os_details": []}
         
-        # OS Tespiti Parse
-        os_matches = re.findall(r"OS details: (.+)", output)
-        if not os_matches:
-            os_matches = re.findall(r"Running: (.+)", output)
+        # 1. OS Tespiti - Running satırı (Alternatifler dahil)
+        running_matches = re.findall(r"Running:\s+(.+)", output)
+        if running_matches:
+            for match in running_matches:
+                # "Linux 2.6.X|3.X", "Windows XP|Vista|7" gibi çoklu durumları ayır
+                alternatives = match.split('|')
+                for alt in alternatives:
+                    cleaned = alt.strip()
+                    if cleaned and cleaned not in self.results["os_guess"]:
+                        self.results["os_guess"].append(cleaned)
+                        data["os"].append(cleaned)
+            self.log(f"Nmap OS Tahmini (Running): {', '.join(data['os'])}", "SUCCESS")
+
+        # 2. OS Details - Daha spesifik versiyon tahminleri
+        os_details_matches = re.findall(r"OS details:\s+(.+)", output)
+        if os_details_matches:
+            details_text = os_details_matches[0]
+            # Virgülle ayrılmış farklı senaryolar olabilir
+            scenarios = details_text.split(', ')
+            for scenario in scenarios:
+                cleaned = scenario.strip()
+                if cleaned and cleaned not in self.results["os_guess"]:
+                    self.results["os_guess"].append(cleaned)
+                    data["os_details"].append(cleaned)
+            self.log(f"Nmap OS Detayları: {details_text}", "INFO")
+
+        # 3. OS CPE (Common Platform Enumeration) - Resmi isimlendirme
+        cpe_matches = re.findall(r"OS CPE:\s+(.+)", output)
+        if cpe_matches:
+            cpe_line = cpe_matches[0]
+            self.log(f"Nmap OS CPE Bilgisi: {cpe_line}", "INFO")
+            data["cpe"] = cpe_line
+            
+        # Eğer hiç OS bulunamazsa uyarı ver
+        if not self.results["os_guess"]:
+            self.log("Nmap kesin bir işletim sistemi belirleyemedi. Alternatif prob sonuçlarına bakın.", "WARNING")
         
-        if os_matches:
-            data["os"] = [match.strip() for match in os_matches]
-            self.results["os_guess"].extend(data["os"])
-            self.log(f"Nmap OS Tahmini: {', '.join(data['os'])}", "SUCCESS")
+        # Service Info'dan OS bilgisi çek (her zaman çalışır)
+        service_info = re.search(r"Service Info:\s*OS:\s*([^;]+)", output)
+        if service_info:
+            os_from_service = service_info.group(1).strip()
+            if os_from_service and os_from_service.lower() != "unknown":
+                # Sadece temiz OS adını ekle, "Linux;" gibi değil "Linux" olarak
+                clean_os = os_from_service.rstrip(';').strip()
+                if clean_os and f"Service Info: {clean_os}" not in self.results["os_guess"]:
+                    self.results["os_guess"].append(f"Service Info: {clean_os}")
+                    self.log(f"Servis Bilgisinden OS: {clean_os}", "INFO")
+        
+        # CPE bilgisini de ekle
+        cpe_section = re.search(r"OS CPE:\s+(.+)", output)
+        if cpe_section:
+            cpe_line = cpe_section.group(1).strip()
+            self.log(f"Nmap OS CPE Bilgisi: {cpe_line}", "INFO")
+            
+        # Agresif OS tahminlerini al (her durumda kontrol et)
+        agg_section = re.search(r"Aggressive OS guesses:(.+?)(?:\n\n|\n$)", output, re.DOTALL)
+        if agg_section:
+            guesses_text = agg_section.group(1).strip()
+            # Her satırı ayrı tahmin olarak al
+            for line in guesses_text.split('\n'):
+                guess = line.strip()
+                if guess and len(guess) > 5:  # Boş veya çok kısa olmayanlar
+                    if guess not in self.results["os_guess"]:
+                        self.results["os_guess"].append(guess)
+            if agg_section:
+                self.log(f"Agresif OS Tahminleri Bulundu: Nmap'in önerdiği tüm olasılıklar rapora eklendi", "WARNING")
 
         # Port ve Servis Parse
         port_pattern = re.compile(r"(\d+)/tcp\s+open\s+(\w+)\s+(.*)")
@@ -101,6 +158,11 @@ class AdvancedScanner:
             port = match.group(1)
             service = match.group(2)
             version = match.group(3).strip()
+            
+            # "Aggressive OS guesses" veya diğer nmap notlarını servis olarak ekleme
+            if "Aggressive OS" in version or "Network Distance" in version or "Service Info" in version:
+                continue  # Bunları servis olarak kabul etme
+                
             data["ports"].append({"port": port, "service": service, "version": version})
             self.results["open_ports"].append(port)
             self.results["services"].append(f"{service} v{version}")
@@ -198,10 +260,36 @@ class AdvancedScanner:
         # İşletim Sistemi
         print(f"\n{Fore.CYAN}[+] İşletim Sistemi Tahminleri:{Style.RESET_ALL}")
         if self.results["os_guess"]:
-            # Tekilleştir ve yaz
-            unique_os = list(set(self.results["os_guess"]))
-            for os in unique_os:
-                print(f"    - {os}")
+            # Her OS tahminini ayrı satırda göster
+            seen_os = set()
+            for os_item in self.results["os_guess"]:
+                # Gereksiz bilgileri filtrele
+                if "Network Distance" in os_item or "No exact OS matches" in os_item:
+                    continue
+                
+                # Service Info ise özel format
+                if 'Service Info:' in os_item:
+                    cleaned = os_item.replace('Service Info:', '').replace('OS:', '').strip()
+                    # CPE bilgisini ve noktalı virgülü ayır
+                    if 'CPE:' in cleaned:
+                        cleaned = cleaned.split('CPE:')[0].strip()
+                    # Noktalı virgül ve diğer gereksiz karakterleri temizle
+                    cleaned = cleaned.rstrip(';').rstrip(',').strip()
+                    if cleaned and cleaned not in seen_os and len(cleaned) > 1:
+                        print(f"    {Fore.GREEN}✓{Style.RESET_ALL} Servis Bilgisi: {cleaned}")
+                        seen_os.add(cleaned)
+                elif ',' in os_item:
+                    # Virgülle ayrılmış çoklu tahminleri ayır
+                    parts = os_item.split(',')
+                    for part in parts:
+                        cleaned = part.strip()
+                        if cleaned and cleaned not in seen_os and len(cleaned) > 3:
+                            print(f"    {Fore.YELLOW}•{Style.RESET_ALL} {cleaned}")
+                            seen_os.add(cleaned)
+                else:
+                    if os_item not in seen_os and len(os_item) > 3:
+                        print(f"    {Fore.YELLOW}•{Style.RESET_ALL} {os_item}")
+                        seen_os.add(os_item)
         else:
             print("    - Belirlenemedi.")
 
