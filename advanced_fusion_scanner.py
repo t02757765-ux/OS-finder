@@ -3,6 +3,7 @@
 """
 Advanced Fusion OS & Service Scanner (AFOSS)
 Combines Nmap, Masscan, Netcat, Scapy and custom probes for deep analysis.
+Fixed Version: Corrected syntax errors and improved parsing logic.
 """
 import argparse
 import subprocess
@@ -14,6 +15,7 @@ from datetime import datetime
 from collections import defaultdict
 import threading
 import queue
+
 # Renk Kodları
 class Colors:
     HEADER = '\033[95m'
@@ -25,6 +27,7 @@ class Colors:
     ENDC = '\033[0m'
     BOLD = '\033[1m'
     UNDERLINE = '\033[4m'
+
 def log(message, level="INFO", verbose=False):
     if level == "ERROR":
         print(f"{Colors.FAIL}[ERROR]{Colors.ENDC} {message}")
@@ -36,52 +39,70 @@ def log(message, level="INFO", verbose=False):
         print(f"{Colors.OKCYAN}[INFO]{Colors.ENDC} {message}")
     elif level == "DEBUG" and verbose:
         print(f"{Colors.HEADER}[DEBUG]{Colors.ENDC} {message}")
+
 def check_tool_installed(tool_name):
     try:
         subprocess.run(["which", tool_name], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
         return True
     except subprocess.CalledProcessError:
         return False
+
 def run_masscan(target, ports="1-65535", rate=1000, verbose=False):
     """Runs Masscan and parses output."""
     print(f"\n{Colors.BOLD}>>> Masscan Hızlı Tarama Başlatılıyor...{Colors.ENDC}")
     if not check_tool_installed("masscan"):
         log("Masscan bulunamadı! Lütfen 'sudo apt install masscan' ile yükleyin.", "WARNING", verbose)
         return []
-    cmd = ["sudo", "masscan", "-p", ports, target, "--rate", str(rate)]
+    
+    cmd = ["sudo", "masscan", "-p", ports, target, "--rate", str(rate), "--wait", "5"]
     if verbose:
         log(f"Masscan Komutu: {' '.join(cmd)}", "DEBUG", True)
+    
     found_ports = []
     try:
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         stdout, stderr = process.communicate(timeout=300)
+        
         if verbose:
             log(f"Masscan Ham Çıktı:\n{stdout}", "DEBUG", True)
+            
         # Masscan output format: "Discovered open port 80/tcp on host 192.168.1.1"
         for line in stdout.splitlines():
+            # Daha esnek regex yapısı
             match = re.search(r"Discovered open port (\d+)/(\w+) on host ([\d\.]+)", line)
             if match:
                 port = int(match.group(1))
                 proto = match.group(2)
                 ip = match.group(3)
-                if ip == target:
+                # Hedef IP ile eşleşenleri al
+                if ip == target or target.lower() in ip.lower(): 
                     found_ports.append({'port': port, 'protocol': proto, 'state': 'open', 'source': 'Masscan'})
+            elif verbose and line.strip():
+                log(f"Masscan satırı atlandı (format uyuşmazlığı): {line}", "DEBUG", True)
+                
     except Exception as e:
         log(f"Masscan hatası: {str(e)}", "ERROR")
     
     return found_ports
+
 def run_nmap(target, ports=None, version_detect=True, os_detect=True, verbose=False):
     """Runs Nmap with detailed service and OS detection."""
     print(f"\n{Colors.BOLD}>>> Nmap Detaylı Tarama Başlatılıyor...{Colors.ENDC}")
     if not check_tool_installed("nmap"):
         log("Nmap bulunamadı! Lütfen 'sudo apt install nmap' ile yükleyin.", "WARNING", verbose)
         return [], {}, []
-    cmd = ["sudo", "nmap", "-Pn"]
+    
+    cmd = ["sudo", "nmap", "-Pn", "--min-rate", "1000"]
+    
     if ports:
-        port_str = ",".join([str(p['port']) for p in ports]) if isinstance(ports, list) else ports
-        cmd.extend(["-p", port_str])
+        if isinstance(ports, list):
+            port_str = ",".join([str(p['port']) for p in ports])
+            cmd.extend(["-p", port_str])
+        else:
+            cmd.extend(["-p", str(ports)])
     else:
-        cmd.extend(["-p-", "--top-ports", "1000"])
+        cmd.extend(["--top-ports", "1000"])
+        
     if version_detect:
         cmd.append("-sV")
     if os_detect:
@@ -89,16 +110,23 @@ def run_nmap(target, ports=None, version_detect=True, os_detect=True, verbose=Fa
     if verbose:
         cmd.append("-vv")
         log(f"Nmap Komutu: {' '.join(cmd)}", "DEBUG", True)
+        
     cmd.append(target)
+    
     services = {}
     os_info = []
+    
     try:
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         stdout, _ = process.communicate(timeout=600)
+        
         if verbose:
-            log(f"Nmap Ham Çıktı:\n{stdout}", "DEBUG", True)
-        # Parse Services
+            log(f"Nmap Ham Çıktı (İlk 2000 karakter):\n{stdout[:2000]}...", "DEBUG", True)
+            
+        # Parse Services - Geliştirilmiş Regex
+        # Format: 80/tcp   open  http    Apache httpd 2.4.7 ((Ubuntu))
         port_pattern = re.compile(r"^(\d+)/(\w+)\s+(open|filtered|closed)\s+(\S+)\s*(.*)?$")
+        
         for line in stdout.splitlines():
             match = port_pattern.match(line.strip())
             if match:
@@ -107,59 +135,81 @@ def run_nmap(target, ports=None, version_detect=True, os_detect=True, verbose=Fa
                 state = match.group(3)
                 service_name = match.group(4)
                 version_info = match.group(5).strip() if match.group(5) else ""
+                
                 if state == 'open':
                     services[port_num] = {
+                        'port': port_num,
                         'protocol': proto,
                         'service': service_name,
                         'version': version_info,
+                        'state': state,
                         'source': 'Nmap'
                     }
         
-        # Parse OS
+        # Parse OS - Geliştirilmiş Mantık
         in_os_section = False
         for line in stdout.splitlines():
+            # OS Details Bölümü
             if "OS details:" in line:
                 in_os_section = True
+                # Aynı satırda bilgi olabilir
+                parts = line.split("OS details:", 1)
+                if len(parts) > 1:
+                    os_candidates = parts[1].split(",")
+                    for cand in os_candidates:
+                        cand = cand.strip()
+                        if cand and "Network Distance" not in cand:
+                            os_info.append({'os': cand, 'accuracy': 'Detay', 'source': 'Nmap (Details)'})
                 continue
+            
             if in_os_section:
-                if line.strip().startswith("Network Distance"):
-                    break
-                if "%" in line:
-                    parts = line.split(":", 1)
-                    if len(parts) == 2:
-                        accuracy = parts[0].strip()
-                        os_name = parts[1].strip()
-                        os_info.append({'os': os_name, 'accuracy': accuracy, 'source': 'Nmap'})
+                if line.strip().startswith("Network Distance") or line.strip().startswith("Too many"):
+                    in_os_section = False
+                    continue
+                # Yüzde içeren satırlar (Aggressive OS guesses)
+                if "%" in line and "(" in line:
+                    # Format: 94% Linux 5.4
+                    match = re.match(r"\s*(\d+)%\s*(.+)", line)
+                    if match:
+                        acc = match.group(1)
+                        name = match.group(2).strip()
+                        os_info.append({'os': name, 'accuracy': f"%{acc}", 'source': 'Nmap (Aggressive)'})
         
-        # Also check "Running:" section for alternative OS matches
+        # Running: Bölümü (Kesinleşmiş OS)
         for line in stdout.splitlines():
             if "Running:" in line:
                 running_part = line.split("Running:", 1)[1].strip()
-                # Split by '|' for alternatives
-                alternatives = running_part.split('|')
-                for alt in alternatives:
-                    os_info.append({'os': alt.strip(), 'accuracy': 'Yüksek', 'source': 'Nmap (Running)'})
+                if running_part and "None" not in running_part:
+                    alternatives = running_part.split('|')
+                    for alt in alternatives:
+                        alt = alt.strip()
+                        if alt:
+                            os_info.append({'os': alt, 'accuracy': 'Yüksek', 'source': 'Nmap (Running)'})
                 break
                 
-        # Check Service Info for OS hints
+        # Service Info: Bölümü
         for line in stdout.splitlines():
             if "Service Info:" in line and "OS:" in line:
                 info_part = line.split("Service Info:", 1)[1].strip()
                 os_match = re.search(r"OS:\s*([^;]+)", info_part)
                 if os_match:
                     os_name = os_match.group(1).strip()
-                    if os_name != "Unknown":
+                    if os_name != "Unknown" and os_name:
                         os_info.append({'os': os_name, 'accuracy': 'Servis Bazlı', 'source': 'Nmap (Service Info)'})
+                        
         return list(services.values()), os_info, []
+        
     except Exception as e:
         log(f"Nmap hatası: {str(e)}", "ERROR")
         return [], [], []
+
 def run_netcat_banner(target, ports, verbose=False):
     """Uses Netcat to grab banners from open ports."""
     print(f"\n{Colors.BOLD}>>> Netcat Banner Grabbing Başlatılıyor...{Colors.ENDC}")
     if not check_tool_installed("nc"):
         log("Netcat (nc) bulunamadı. Banner grabbing atlanıyor.", "WARNING", verbose)
         return {}
+    
     banners = {}
     for port_info in ports:
         port = port_info['port']
@@ -168,8 +218,11 @@ def run_netcat_banner(target, ports, verbose=False):
             continue
             
         try:
-            cmd = ["nc", "-v", "-w", "2", target, str(port)]
+            # Sessiz modda çalıştır, sadece stdout'u al
+            cmd = ["nc", "-w", "2", target, str(port)]
             process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            
+            # Basit bir newline göndererek yanıt tetikle
             try:
                 stdout, stderr = process.communicate(input="\n", timeout=5)
             except subprocess.TimeoutExpired:
@@ -177,15 +230,19 @@ def run_netcat_banner(target, ports, verbose=False):
                 stdout, stderr = process.communicate()
             
             banner_data = (stdout + stderr).strip()
-            if banner_
+            
+            # DÜZELTME: Eksik koşul tamamlanması
+            if banner_data and len(banner_data) > 0:
                 banners[port] = banner_data
                 if verbose:
                     log(f"Port {port} Banner:\n{banner_data}", "DEBUG", True)
+                    
         except Exception as e:
             if verbose:
                 log(f"Port {port} Netcat hatası: {str(e)}", "WARNING", True)
     
     return banners
+
 def custom_probe_scan(target, ports, verbose=False):
     """Custom simple socket probes for service detection."""
     print(f"\n{Colors.BOLD}>>> Özel Prob Taraması Başlatılıyor...{Colors.ENDC}")
@@ -195,7 +252,10 @@ def custom_probe_scan(target, ports, verbose=False):
         "HTTP": b"GET / HTTP/1.0\r\n\r\n",
         "SMTP": b"EHLO test.local\r\n",
         "FTP": b"USER anonymous\r\n",
+        "HELP": b"HELP\r\n",
+        "STATS": b"STATS\r\n"
     }
+    
     for port_info in ports:
         port = port_info['port']
         proto = port_info.get('protocol', 'tcp')
@@ -204,19 +264,21 @@ def custom_probe_scan(target, ports, verbose=False):
         
         detected_service = None
         detected_banner = None
+        
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(3)
             sock.connect((target, port))
             
-            # Try to read initial banner
+            # İlk banner okuma
             try:
                 initial_banner = sock.recv(1024).decode('utf-8', errors='ignore').strip()
                 if initial_banner:
                     detected_banner = initial_banner
             except socket.timeout:
                 pass
-            # If no banner, send probes
+            
+            # Eğer banner yoksa prob gönder
             if not detected_banner:
                 for service_name, probe_data in probes.items():
                     sock.sendall(probe_data)
@@ -239,11 +301,13 @@ def custom_probe_scan(target, ports, verbose=False):
                 }
                 if verbose:
                     log(f"Port {port} Özel Prob Sonucu: {detected_service}", "DEBUG", True)
+                    
         except Exception as e:
             if verbose:
                 log(f"Port {port} Özel Prob Hatası: {str(e)}", "WARNING", True)
     
     return results
+
 def analyze_vulnerabilities(service_name, version, banner):
     """Basit zafiyet analizi (örnek amaçlı)."""
     vulnerabilities = []
@@ -252,11 +316,14 @@ def analyze_vulnerabilities(service_name, version, banner):
     if "vsftpd 2.3.4" in search_text:
         vulnerabilities.append({"id": "CVE-2011-2523", "severity": "CRITICAL", "description": "VSFTPD 2.3.4 Backdoor"})
     if "apache" in search_text and ("2.2." in search_text or "2.0." in search_text):
-        vulnerabilities.append({"id": "GENERIC", "severity": "MEDIUM", "description": "Eski Apache sürümü potansiyel açıklara sahip olabilir."})
+        vulnerabilities.append({"id": "GENERIC-APACHE", "severity": "MEDIUM", "description": "Eski Apache sürümü potansiyel açıklara sahip olabilir."})
     if "openssh" in search_text and ("3." in search_text or "4." in search_text or "5." in search_text):
-        vulnerabilities.append({"id": "GENERIC", "severity": "HIGH", "description": "Eski OpenSSH sürümü potansiyel açıklara sahip olabilir."})
+        vulnerabilities.append({"id": "GENERIC-SSH", "severity": "HIGH", "description": "Eski OpenSSH sürümü potansiyel açıklara sahip olabilir."})
+    if "iis" in search_text and ("6.0" in search_text or "5.0" in search_text):
+        vulnerabilities.append({"id": "GENERIC-IIS", "severity": "HIGH", "description": "Eski Microsoft IIS sürümü riskli olabilir."})
         
     return vulnerabilities
+
 def fusion_engine(masscan_results, nmap_services, nmap_os, netcat_banners, custom_probes, verbose=False):
     """Birleştirir, çakışmaları çözer ve en iyi sonucu üretir."""
     print(f"\n{Colors.BOLD}>>> Fusion Motoru Sonuçları Birleştiriyor...{Colors.ENDC}")
@@ -264,6 +331,7 @@ def fusion_engine(masscan_results, nmap_services, nmap_os, netcat_banners, custo
     final_ports = {}
     final_os = []
     all_vulnerabilities = []
+    
     # 1. Port ve Servis Birleştirme
     for res in masscan_results:
         port = res['port']
@@ -276,22 +344,26 @@ def fusion_engine(masscan_results, nmap_services, nmap_os, netcat_banners, custo
             'banner': '',
             'sources': ['Masscan']
         }
+        
     for svc in nmap_services:
         port = svc['port']
         if port in final_ports:
             final_ports[port]['service'] = svc.get('service', final_ports[port]['service'])
             final_ports[port]['version'] = svc.get('version', final_ports[port]['version'])
-            final_ports[port]['sources'].append('Nmap')
+            final_ports[port]['state'] = svc.get('state', 'open')
+            if 'Nmap' not in final_ports[port]['sources']:
+                final_ports[port]['sources'].append('Nmap')
         else:
             final_ports[port] = {
                 'port': port,
                 'protocol': svc.get('protocol', 'tcp'),
-                'state': 'open',
+                'state': svc.get('state', 'open'),
                 'service': svc.get('service', 'unknown'),
                 'version': svc.get('version', ''),
                 'banner': '',
                 'sources': ['Nmap']
             }
+            
     for port, banner in netcat_banners.items():
         if port in final_ports:
             final_ports[port]['banner'] = banner
@@ -307,6 +379,7 @@ def fusion_engine(masscan_results, nmap_services, nmap_os, netcat_banners, custo
                 'banner': banner,
                 'sources': ['Netcat']
             }
+            
     for port, probe_res in custom_probes.items():
         if port in final_ports:
             if probe_res.get('service') and final_ports[port]['service'] == 'unknown':
@@ -325,25 +398,36 @@ def fusion_engine(masscan_results, nmap_services, nmap_os, netcat_banners, custo
                 'banner': probe_res.get('banner', ''),
                 'sources': ['CustomProbe']
             }
-    # 2. OS Bilgilerini Birleştirme
-    final_os = nmap_os
+            
+    # 2. OS Bilgilerini Birleştirme (Tekilleştirme)
+    seen_os = set()
+    for item in nmap_os:
+        key = item['os']
+        if key not in seen_os:
+            final_os.append(item)
+            seen_os.add(key)
+            
     # 3. Zafiyet Analizi
     for port, info in final_ports.items():
         vulns = analyze_vulnerabilities(info['service'], info['version'], info['banner'])
         if vulns:
             info['vulnerabilities'] = vulns
             all_vulnerabilities.extend(vulns)
+            
     return list(final_ports.values()), final_os, all_vulnerabilities
+
 def print_report(target, ports, os_info, vulnerabilities, start_time, verbose=False):
     """Renkli ve detaylı rapor çıktısı."""
     end_time = datetime.now()
     duration = end_time - start_time
+    
     print("\n" + "="*80)
     print(f"{Colors.BOLD}{Colors.OKBLUE}>>> AFOSS TARAMA RAPORU{Colors.ENDC}")
     print(f"{Colors.OKCYAN}Hedef:{Colors.ENDC} {target}")
     print(f"{Colors.OKCYAN}Tarih:{Colors.ENDC} {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{Colors.OKCYAN}Süre:{Colors.ENDC} {duration}")
     print("="*80)
+    
     print(f"\n{Colors.BOLD}{Colors.OKGREEN}>>> AÇIK PORTLAR VE SERVİSLER{Colors.ENDC}")
     if not ports:
         print(f"{Colors.WARNING}Hiçbir açık port veya servis bulunamadı.{Colors.ENDC}")
@@ -358,16 +442,19 @@ def print_report(target, ports, os_info, vulnerabilities, start_time, verbose=Fa
             banner = p.get('banner', '')
             sources = ", ".join(p.get('sources', []))
             vulns = p.get('vulnerabilities', [])
+            
             service_str = f"{service}"
             if version:
                 service_str += f" ({version})"
             
             print(f"\n{Colors.BOLD}Port {port}/{proto}:{Colors.ENDC} {Colors.OKGREEN}{state}{Colors.ENDC}")
             print(f"  {Colors.OKCYAN}Servis:{Colors.ENDC} {service_str}")
+            
             if banner:
-                banner_display = banner[:100].replace('\n', ' ')
+                banner_display = banner[:100].replace('\n', ' | ')
                 if len(banner) > 100: banner_display += "..."
                 print(f"  {Colors.OKCYAN}Banner:{Colors.ENDC} {banner_display}")
+                
             print(f"  {Colors.OKCYAN}Kaynaklar:{Colors.ENDC} {sources}")
             
             if vulns:
@@ -375,6 +462,7 @@ def print_report(target, ports, os_info, vulnerabilities, start_time, verbose=Fa
                 for v in vulns:
                     severity_color = Colors.FAIL if v['severity'] == 'CRITICAL' else (Colors.WARNING if v['severity'] == 'HIGH' else Colors.OKCYAN)
                     print(f"    {severity_color}[{v['severity']}]{Colors.ENDC} {v['id']}: {v['description']}")
+                    
     print(f"\n{Colors.BOLD}{Colors.OKGREEN}>>> İŞLETİM SİSTEMİ TAHMİNLERİ{Colors.ENDC}")
     if not os_info:
         print(f"{Colors.WARNING}İşletim sistemi hakkında kesin bir bilgi elde edilemedi.{Colors.ENDC}")
@@ -385,6 +473,7 @@ def print_report(target, ports, os_info, vulnerabilities, start_time, verbose=Fa
             source = item.get('source', 'Bilinmiyor')
             acc_str = f"({acc})" if acc != 'N/A' else ""
             print(f"  • {os_name} {acc_str} {Colors.OKCYAN}[Kaynak: {source}]{Colors.ENDC}")
+            
     if vulnerabilities:
         print(f"\n{Colors.BOLD}{Colors.FAIL}>>> GENEL ZAFİYET ÖZETİ{Colors.ENDC}")
         unique_vulns = {v['id']: v for v in vulnerabilities}.values()
@@ -395,17 +484,20 @@ def print_report(target, ports, os_info, vulnerabilities, start_time, verbose=Fa
     print("\n" + "="*80)
     print(f"{Colors.OKGREEN}Tarama Tamamlandı.{Colors.ENDC}")
     print("="*80 + "\n")
+
 def main():
     parser = argparse.ArgumentParser(description="Advanced Fusion OS & Service Scanner (AFOSS)")
     parser.add_argument("-t", "--target", required=True, help="Hedef IP adresi veya alan adı")
-    parser.add_argument("-p", "--ports", default="1-65535", help="Taranacak portlar")
+    parser.add_argument("-p", "--ports", default="1-65535", help="Taranacak portlar (örn: 80,443 veya 1-1000)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Detaylı çıktı modu")
     parser.add_argument("--no-masscan", action="store_true", help="Masscan taramasını atla")
     parser.add_argument("--no-nmap", action="store_true", help="Nmap taramasını atla")
     parser.add_argument("--no-nc", action="store_true", help="Netcat banner grabbing'i atla")
     parser.add_argument("--no-custom", action="store_true", help="Özel prob taramasını atla")
     parser.add_argument("--rate", type=int, default=1000, help="Masscan tarama hızı")
+    
     args = parser.parse_args()
+    
     print(f"{Colors.HEADER}")
     print(r"""
   ___  ____  _  ________      _________  ____  __
@@ -413,7 +505,7 @@ def main():
 / _  / /_/ /    / / /  | |/ / /__/ / /|_/ /    / 
 /____/\____/_/|_/ /_/   |___/\___/_/  /__/_/|_|  
                                                  
-Advanced Fusion OS & Service Scanner (AFOSS)
+Advanced Fusion OS & Service Scanner (AFOSS) - Fixed
     """)
     print(f"{Colors.ENDC}")
     
@@ -421,27 +513,37 @@ Advanced Fusion OS & Service Scanner (AFOSS)
     verbose = args.verbose
     
     start_time = datetime.now()
+    
     masscan_results = []
     nmap_services = []
     nmap_os = []
     netcat_banners = {}
     custom_probes = {}
+    
+    # 1. Masscan (Hızlı Port Bulma)
     if not args.no_masscan:
         masscan_results = run_masscan(target, ports=args.ports, rate=args.rate, verbose=verbose)
     
+    # 2. Nmap (Detaylı Servis ve OS)
     nmap_target_ports = masscan_results if masscan_results else args.ports
     if not args.no_nmap:
         nmap_services, nmap_os, _ = run_nmap(target, ports=nmap_target_ports, version_detect=True, os_detect=True, verbose=verbose)
+    
+    # Taranacak port listesini oluştur (Masscan + Nmap birleşimi)
     ports_for_probing = []
     seen_ports = set()
+    
     for p in masscan_results:
         if p['port'] not in seen_ports:
             ports_for_probing.append(p)
             seen_ports.add(p['port'])
+            
     for s in nmap_services:
         if s['port'] not in seen_ports:
             ports_for_probing.append({'port': s['port'], 'protocol': s.get('protocol', 'tcp'), 'state': 'open', 'source': 'Nmap'})
             seen_ports.add(s['port'])
+            
+    # 3. Banner Grabbing ve Özel Proplar
     if ports_for_probing:
         if not args.no_nc:
             netcat_banners = run_netcat_banner(target, ports_for_probing, verbose=verbose)
@@ -449,6 +551,8 @@ Advanced Fusion OS & Service Scanner (AFOSS)
             custom_probes = custom_probe_scan(target, ports_for_probing, verbose=verbose)
     else:
         log("Taranacak port bulunamadı, ileriye dönük taramalar atlanıyor.", "WARNING", verbose)
+        
+    # 4. Fusion Engine (Birleştirme)
     final_ports, final_os, final_vulns = fusion_engine(
         masscan_results, 
         nmap_services, 
@@ -457,7 +561,10 @@ Advanced Fusion OS & Service Scanner (AFOSS)
         custom_probes, 
         verbose=verbose
     )
+    
+    # 5. Raporlama
     print_report(target, final_ports, final_os, final_vulns, start_time, verbose=verbose)
+
 if __name__ == "__main__":
     try:
         main()
